@@ -19,6 +19,9 @@ import warnings
 import json
 import re
 import time
+import sqlite3
+import os
+import hashlib
 
 warnings.filterwarnings("ignore")
 
@@ -225,6 +228,96 @@ HEADERS        = {
     "Referer":    "https://www.glo.or.th/",
     "Accept":     "application/json, text/plain, */*",
 }
+DB_PATH = os.path.join(os.path.dirname(__file__), "glo_cache.db")
+
+# ══════════════════════════════════════════════════════════
+# SQLITE CACHE LAYER
+# ══════════════════════════════════════════════════════════
+def _db_conn():
+    """Return a SQLite connection; creates DB + table if needed."""
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS lottery_results (
+            draw_date TEXT PRIMARY KEY,
+            prize1    TEXT,
+            near1     TEXT,
+            front3    TEXT,
+            back3     TEXT,
+            back2     TEXT,
+            prize2    TEXT,
+            prize3    TEXT,
+            fetched_at TEXT DEFAULT (datetime('now'))
+        )
+    """)
+    conn.commit()
+    return conn
+
+def db_get(draw_date: str) -> dict | None:
+    """Load a result from SQLite cache. Returns None if not found."""
+    try:
+        conn = _db_conn()
+        row  = conn.execute(
+            "SELECT * FROM lottery_results WHERE draw_date=?", (draw_date,)
+        ).fetchone()
+        conn.close()
+        if row:
+            cols = ["draw_date","prize1","near1","front3","back3","back2","prize2","prize3","fetched_at"]
+            d = dict(zip(cols, row))
+            # Deserialise JSON lists
+            for field in ["near1","front3","back3","prize2","prize3"]:
+                try:
+                    d[field] = json.loads(d[field]) if d[field] else []
+                except Exception:
+                    d[field] = []
+            d["date"] = d.pop("draw_date")
+            d.pop("fetched_at", None)
+            return d
+    except Exception:
+        pass
+    return None
+
+def db_put(result: dict):
+    """Save a result dict to SQLite cache."""
+    try:
+        conn = _db_conn()
+        conn.execute("""
+            INSERT OR REPLACE INTO lottery_results
+              (draw_date, prize1, near1, front3, back3, back2, prize2, prize3)
+            VALUES (?,?,?,?,?,?,?,?)
+        """, (
+            result.get("date",""),
+            str(result.get("prize1","")),
+            json.dumps(result.get("near1",  []), ensure_ascii=False),
+            json.dumps(result.get("front3", []), ensure_ascii=False),
+            json.dumps(result.get("back3",  []), ensure_ascii=False),
+            str(result.get("back2","")),
+            json.dumps(result.get("prize2", []), ensure_ascii=False),
+            json.dumps(result.get("prize3", []), ensure_ascii=False),
+        ))
+        conn.commit()
+        conn.close()
+    except Exception:
+        pass
+
+def db_count() -> int:
+    """Return number of cached rows."""
+    try:
+        conn = _db_conn()
+        n = conn.execute("SELECT COUNT(*) FROM lottery_results").fetchone()[0]
+        conn.close()
+        return n
+    except Exception:
+        return 0
+
+def db_clear():
+    """Wipe all cached rows."""
+    try:
+        conn = _db_conn()
+        conn.execute("DELETE FROM lottery_results")
+        conn.commit()
+        conn.close()
+    except Exception:
+        pass
 CHART_TEMPLATE = dict(
     template="plotly_dark",
     paper_bgcolor="rgba(0,0,0,0)",
@@ -333,21 +426,31 @@ def _make_demo_result(draw_date: str, seed: int = 42) -> dict:
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def load_historical_data(n_draws: int = 52) -> pd.DataFrame:
-    """Load historical results; falls back to demo data if API fails."""
-    dates  = get_draw_dates(n_draws + 5)[:n_draws]
-    rows   = []
-    failed = 0
+    """
+    Load historical results with 3-tier priority:
+      1. SQLite cache (instant)  ← hits first
+      2. GLO API (slow, online)
+      3. Demo data (offline fallback)
+    """
+    dates       = get_draw_dates(n_draws + 5)[:n_draws]
+    rows        = []
+    need_fetch  = [d for d in dates if db_get(d) is None]
+    cached_rows = [db_get(d) for d in dates if db_get(d) is not None]
+    rows.extend(cached_rows)
 
-    bar = st.progress(0, text="⏳ กำลังโหลดข้อมูลจาก GLO API…")
-    for i, d in enumerate(dates):
-        bar.progress((i + 1) / len(dates), text=f"⏳ โหลดงวด {d} …")
-        seed = int(d.replace("/", "")) % 9999997
-        result = fetch_result_by_date(d) or _make_demo_result(d, seed)
-        if result and result.get("prize1"):
-            rows.append(result)
-        else:
-            failed += 1
-    bar.empty()
+    if need_fetch:
+        bar = st.progress(0, text=f"⏳ กำลังโหลด {len(need_fetch)} งวดใหม่จาก GLO API…")
+        for i, d in enumerate(need_fetch):
+            bar.progress((i + 1) / len(need_fetch), text=f"⏳ โหลดงวด {d} …")
+            seed   = int(d.replace("/", "")) % 9999997
+            result = fetch_result_by_date(d)
+            if result and result.get("prize1"):
+                db_put(result)            # 💾 save to SQLite
+                rows.append(result)
+            else:
+                demo = _make_demo_result(d, seed)
+                rows.append(demo)        # demo ไม่ save ลง DB
+        bar.empty()
 
     if not rows:
         st.warning("⚠️  ไม่สามารถเชื่อมต่อ GLO API ได้ กำลังใช้ข้อมูลสาธิต")
@@ -561,7 +664,7 @@ def chart_frequency_heatmap(freq: dict) -> go.Figure:
         texttemplate="%{text}%",
         textfont=dict(size=11, family="IBM Plex Mono"),
         showscale=True,
-        colorbar=dict(title="ความถี่ %", titlefont=dict(color="#7986cb")),
+        colorbar=dict(title=dict(text="ความถี่ %", font=dict(color="#7986cb"))),
     ))
     fig.update_layout(
         title="🔥 Frequency Heatmap — ความถี่เลขแต่ละหลัก (%)",
@@ -683,7 +786,7 @@ def chart_absence_heatmap(absence: dict) -> go.Figure:
         texttemplate="%{text} งวด",
         textfont=dict(size=11, family="IBM Plex Mono"),
         showscale=True,
-        colorbar=dict(title="งวดที่ไม่ออก", titlefont=dict(color="#7986cb")),
+        colorbar=dict(title=dict(text="งวดที่ไม่ออก", font=dict(color="#7986cb"))),
     ))
     fig.update_layout(
         title="🧊 Absence Streak Heatmap — เลขที่ไม่ออกมากี่งวดแล้ว",
@@ -710,6 +813,22 @@ def main():
         refresh = st.button("🔄  Refresh ข้อมูล", use_container_width=True)
         if refresh:
             st.cache_data.clear()
+            st.rerun()
+        st.divider()
+        # DB stats
+        cached_n = db_count()
+        st.markdown(f"""
+<div style='background:#0f1628;border:1px solid #1e2a4a;border-radius:8px;padding:12px;
+  font-family:IBM Plex Mono;font-size:0.72rem;color:#7986cb;line-height:2'>
+<div style='color:#00ff88;margin-bottom:4px'>💾 SQLite Cache</div>
+บันทึกแล้ว: <b style='color:#e8eaf6'>{cached_n} งวด</b><br>
+ไฟล์: <span style='color:#f5c842'>glo_cache.db</span>
+</div>
+""", unsafe_allow_html=True)
+        if st.button("🗑️  ล้าง Cache DB", use_container_width=True):
+            db_clear()
+            st.cache_data.clear()
+            st.success("ล้างแล้ว!")
             st.rerun()
         st.divider()
         st.markdown("""
